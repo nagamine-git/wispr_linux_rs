@@ -1,0 +1,17 @@
+/target/
+**/*.rs.bk
+*.pdb
+*.swp
+.DS_Store
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+
+# Config files with sensitive data
+.env
+config.toml
+
+# Audio recordings
+*.wav
