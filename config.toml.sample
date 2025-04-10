@@ -1,0 +1,42 @@
+# Wispr Linux RS サンプル設定ファイル
+# ~/.config/wispr/wispr_linux_rs/config.toml に保存するか、
+# --config オプションで指定してください
+
+# OpenAI APIキー
+# 音声認識に使用されます
+api_key = "your_openai_api_key_here"
+
+# 一時ファイルの保存先
+# 録音ファイルが一時的に保存されます
+# デフォルトでは ~/.cache/wispr/wispr_linux_rs が使用されます
+# temp_dir = "/path/to/temp/directory"
+
+# 録音設定
+[recording]
+# 最大録音時間（秒）
+max_duration_secs = 60
+
+# サンプルレート
+sample_rate = 44100
+
+# 録音開始/停止時の効果音
+play_sounds = true
+
+# UI設定
+[ui]
+# ダークモード
+dark_mode = true
+
+# 通知の表示
+show_notifications = true
+
+# ショートカット設定
+[shortcuts]
+# 録音開始/停止のショートカット
+# 空白にするとショートカットを無効化
+toggle_recording = "Shift+space"
+
+# 自動ペースト
+# 文字起こし後にクリップボードに自動的にコピーし、
+# 必要に応じてアクティブなアプリケーションに自動的にペーストします
+auto_paste = true 

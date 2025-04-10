@@ -1,0 +1,45 @@
+# テスト用設定ファイル
+# --configオプションでのテスト用
+
+# OpenAI APIキー
+# 音声認識に使用されます
+api_key = "test_api_key_for_testing"
+
+# 一時ファイルの保存先
+# 録音ファイルが一時的に保存されます
+temp_dir = "/tmp/wispr-test"
+
+# 録音設定
+[recording]
+# 最大録音時間（秒）
+max_duration_secs = 30
+
+# サンプルレート
+sample_rate = 44100
+
+# 録音開始/停止時の効果音
+play_sounds = true
+
+# UI設定
+[ui]
+# ダークモード
+dark_mode = true
+
+# 通知の表示
+notification_enabled = true
+
+# ショートカット設定
+[shortcuts]
+# 録音開始/停止のショートカット
+# Shift+Spaceの代わりにControl+Altとするテスト
+toggle_recording = "Control+Alt+Space"
+
+# 文字起こしクリアショートカット
+clear_transcript = "Control+Alt+C"
+
+# クリップボードへのコピーショートカット
+copy_to_clipboard = "Control+Alt+X"
+
+# 自動ペースト
+# 文字起こし後にクリップボードに自動的にコピーします
+auto_paste = true 
