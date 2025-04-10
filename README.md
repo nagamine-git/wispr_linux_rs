@@ -62,14 +62,6 @@ auto_paste = true
 
 ## Usage
 
-Run the application:
-
-```bash
-./run_wispr.sh
-```
-
-Or with cargo:
-
 ```bash
 cargo run --features tray
 ```
