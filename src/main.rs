@@ -1,11 +1,16 @@
-use std::process;
-use std::thread::JoinHandle;
-use std::sync::mpsc::{self, Sender};
+// use std::env;
+// use std::process;
+// use std::thread::JoinHandle;
+// use std::sync::mpsc::{self, Sender};
+// use std::path::PathBuf;
+// use std::fs;
+
+// use std::thread;
+
 use anyhow::{Result, Context};
 use log::{info, error, LevelFilter};
 use simple_logger::SimpleLogger;
 use gtk;
-use std::thread;
 use clap::Parser;
 
 #[cfg(feature = "tray")]

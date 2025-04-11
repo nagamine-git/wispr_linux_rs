@@ -1,10 +1,8 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use log::{error, info, debug};
 use std::process::Command;
-use anyhow::{anyhow};
 use std::fs::{self, create_dir_all, File};
 use std::io::Write;
-use std::path::PathBuf;
 use std::io;
 use std::process::Stdio;
 

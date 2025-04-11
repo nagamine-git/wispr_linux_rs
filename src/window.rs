@@ -1,16 +1,14 @@
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::sync::mpsc::{self, Sender, Receiver};
-use std::path::Path;
+use std::sync::mpsc::{self, Sender};
 use gtk::{self, prelude::*};
 use gtk::{Button, Label, Window, WindowType, Box as GtkBox, Orientation, ScrolledWindow, TextView, TextBuffer};
-use gtk::{ComboBoxText, Scale, LevelBar, Frame, Separator};
+use gtk::{ComboBoxText, Scale, LevelBar, Frame, Separator, ToggleButton};
 use glib;
 use glib::ControlFlow;
 use gdk;
-use gdk::keys;
-use log::{info, error, warn};
-use anyhow::{Result, Error};
+use log::{info, error};
+use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -66,11 +64,11 @@ struct UiState {
     state: Arc<Mutex<ThreadSafeState>>,
     tx_main: Sender<WindowMessage>,
     record_button: Button,
-    status_label: Label,
     transcript_buffer: TextBuffer,
     device_combo: ComboBoxText,
     audio_level: LevelBar,
-    shortcut_label: Label,
+    device_box: GtkBox,
+    shortcut_frame: Frame,
 }
 
 impl ThreadSafeState {
@@ -123,17 +121,29 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     
     // Create the main window
     let window = Window::new(WindowType::Toplevel);
-    window.set_title("Wispr Voice-to-Text");
-    window.set_default_size(500, 400);
+    window.set_title("Wispr");
+    window.set_default_size(400, 300);
     window.set_position(gtk::WindowPosition::Center);
     
     // Create UI components
-    let main_box = GtkBox::new(Orientation::Vertical, 10);
-    main_box.set_margin(10);
+    let main_box = GtkBox::new(Orientation::Vertical, 5);
+    main_box.set_margin(5);
+    
+    // --- トグルボタン & レコードボタン セクション --- 
+    let control_toggle_box = GtkBox::new(Orientation::Horizontal, 5);
+    let device_toggle_button = ToggleButton::with_label("⚙"); // アイコンのみに
+    let shortcut_toggle_button = ToggleButton::with_label("⌨"); // アイコンのみに
+    let record_button = Button::with_label("● Record"); // Recordボタンをここに移動し、ラベル変更
+    
+    control_toggle_box.pack_start(&device_toggle_button, false, false, 0);
+    control_toggle_box.pack_start(&shortcut_toggle_button, false, false, 0);
+    control_toggle_box.pack_start(&record_button, true, true, 0); // Recordボタンを中央寄せに
+    main_box.pack_start(&control_toggle_box, false, false, 0);
+    // --- ここまで --- 
     
     // Audio device section
     let device_box = GtkBox::new(Orientation::Horizontal, 5);
-    let device_label = Label::new(Some("Audio Device:"));
+    let device_label = Label::new(Some("Device:"));
     let device_combo = ComboBoxText::new();
     
     // Populate audio devices
@@ -146,7 +156,7 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     
     // Audio level monitoring
     let level_box = GtkBox::new(Orientation::Horizontal, 5);
-    let level_label = Label::new(Some("Audio Level:"));
+    let level_label = Label::new(Some("Level:"));
     let audio_level = LevelBar::new();
     audio_level.set_min_value(0.0);
     audio_level.set_max_value(1.0);
@@ -156,39 +166,24 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     
     main_box.pack_start(&level_box, false, false, 0);
     
-    // Status section
-    let status_box = GtkBox::new(Orientation::Horizontal, 5);
-    let status_label = Label::new(Some("Status: Ready"));
-    let record_button = Button::with_label("Start Recording");
-    
-    status_box.pack_start(&status_label, true, true, 0);
-    status_box.pack_start(&record_button, false, false, 0);
-    
-    main_box.pack_start(&status_box, false, false, 0);
-    
-    // Shortcut information
-    let shortcut_frame = Frame::new(Some("Keyboard Shortcuts"));
+    // --- ショートカット情報 (復活) ---
+    let shortcut_frame = Frame::new(None); // ラベルなし
+    let shortcut_vbox = GtkBox::new(Orientation::Vertical, 2);
+    shortcut_vbox.set_margin(5);
     let shortcut_label = Label::new(None);
     shortcut_label.set_markup(&format!(
-        "<small>Record: <b>Press and hold {}</b> (release to transcribe)\nClear: <b>{}</b>\nCopy: <b>{}</b></small>",
+        "<small>Record: <b>Press and hold {}</b>\nRelease to transcribe.\nClear: <b>{}</b>\nCopy: <b>{}</b></small>",
         config.shortcuts.toggle_recording,
         config.shortcuts.clear_transcript,
         config.shortcuts.copy_to_clipboard
     ));
     shortcut_label.set_halign(gtk::Align::Start);
-    shortcut_frame.add(&shortcut_label);
-    
+    shortcut_vbox.pack_start(&shortcut_label, false, false, 0);
+    shortcut_frame.add(&shortcut_vbox);
     main_box.pack_start(&shortcut_frame, false, false, 0);
-    
-    // Separator
-    let separator = Separator::new(Orientation::Horizontal);
-    main_box.pack_start(&separator, false, false, 5);
+    // --- ここまで ---
     
     // Transcript section
-    let transcript_label = Label::new(Some("Transcript:"));
-    transcript_label.set_halign(gtk::Align::Start);
-    main_box.pack_start(&transcript_label, false, false, 0);
-    
     let scrolled_window = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     scrolled_window.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
     scrolled_window.set_vexpand(true);
@@ -206,7 +201,7 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     // Control buttons
     let control_box = GtkBox::new(Orientation::Horizontal, 5);
     
-    let copy_button = Button::with_label("Copy to Clipboard");
+    let copy_button = Button::with_label("Copy");
     let clear_button = Button::with_label("Clear");
     
     control_box.pack_end(&clear_button, false, false, 0);
@@ -231,17 +226,34 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
         state: thread_safe_state.clone(),
         tx_main: tx_main.clone(),
         record_button: record_button.clone(),
-        status_label: status_label.clone(),
         transcript_buffer: transcript_buffer.clone(),
         device_combo: device_combo.clone(),
         audio_level: audio_level.clone(),
-        shortcut_label: shortcut_label.clone(),
+        device_box: device_box.clone(),
+        shortcut_frame: shortcut_frame.clone(),
     };
     
+    // --- トグルボタンの初期状態と接続 ---
+    device_box.set_visible(false);
+    shortcut_frame.set_visible(false);
+    device_toggle_button.set_active(false);
+    shortcut_toggle_button.set_active(false);
+
+    let device_box_clone = device_box.clone();
+    device_toggle_button.connect_toggled(move |btn| {
+        device_box_clone.set_visible(btn.is_active());
+    });
+
+    let shortcut_frame_clone = shortcut_frame.clone();
+    shortcut_toggle_button.connect_toggled(move |btn| {
+        shortcut_frame_clone.set_visible(btn.is_active());
+    });
+    // --- ここまで ---
+    
     // Connect window close event
-    let tx_clone = tx_main.clone();
+    let _tx_clone = tx_main.clone();
     window.connect_delete_event(move |_, _| {
-        let _ = tx_clone.send(WindowMessage::Exit);
+        let _ = _tx_clone.send(WindowMessage::Exit);
         AUDIO_MONITORING.store(false, Ordering::SeqCst);
         gtk::main_quit();
         glib::Propagation::Stop
@@ -639,17 +651,14 @@ fn is_shortcut_key(event: &gdk::EventKey, shortcut: &str) -> bool {
 fn update_ui_status(ui_state: &UiState, status: AppStatus) {
     match status {
         AppStatus::Idle => {
-            ui_state.status_label.set_text("Status: Ready");
-            ui_state.record_button.set_label("Start Recording");
+            ui_state.record_button.set_label("● Record"); // ボタンラベルに合わせて更新
             ui_state.record_button.set_sensitive(true);
         },
         AppStatus::Recording => {
-            ui_state.status_label.set_text("Status: Recording...");
-            ui_state.record_button.set_label("Stop Recording");
+            ui_state.record_button.set_label("■ Stop"); // ボタンラベルに合わせて更新
             ui_state.record_button.set_sensitive(true);
         },
         AppStatus::Transcribing => {
-            ui_state.status_label.set_text("Status: Transcribing...");
             ui_state.record_button.set_label("Processing...");
             ui_state.record_button.set_sensitive(false);
         }
