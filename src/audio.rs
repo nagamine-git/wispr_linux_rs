@@ -104,8 +104,19 @@ impl AudioRecorder {
         info!("Channels: {}", default_config.channels());
         info!("Sample rate: {}", default_config.sample_rate().0);
         
-        // Create stream config
-        let config: cpal::StreamConfig = default_config.into();
+        // Create stream config from default settings
+        let mut config: cpal::StreamConfig = default_config.into();
+        
+        // 追加: 設定ファイルのサンプルレートを適用
+        if self.config.recording.sample_rate > 0 {
+            info!("Overriding sample rate with user setting: {} Hz", self.config.recording.sample_rate);
+            config.sample_rate = cpal::SampleRate(self.config.recording.sample_rate);
+        }
+        
+        // 汎用的で堅牢なバッファリング設定
+        // システムとデバイスの特性を考慮して自動的に適切なバッファサイズを選択
+        info!("Using system-selected optimal buffer size for maximum compatibility");
+        config.buffer_size = cpal::BufferSize::Default;
         
         // Open output file
         let spec = hound::WavSpec {
