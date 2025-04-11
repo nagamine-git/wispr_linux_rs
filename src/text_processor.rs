@@ -176,25 +176,25 @@ impl TranscriptionProcessor {
         let mut dictionary_instructions = String::new();
         
         if !self.dictionary.words.is_empty() {
-            dictionary_instructions.push_str("また、以下の単語や表現が出てきた場合は必ず指定の書き方に修正してください：\n");
+            dictionary_instructions.push_str("When the following words or expressions appear, make sure to modify them exactly as specified:\n");
             
             for (original, replacement) in &self.dictionary.words {
-                dictionary_instructions.push_str(&format!("- 「{}」という表現が出てきたら「{}」に修正\n", original, replacement));
+                dictionary_instructions.push_str(&format!("- Replace \"{}\" with \"{}\"\n", original, replacement));
             }
             
-            dictionary_instructions.push_str("\n上記の単語は必ず指定通りに修正し、単語の書き方を維持してください。\n\n");
+            dictionary_instructions.push_str("\nEnsure to apply these word replacements exactly as specified while maintaining the word usage context.\n\n");
         }
         
         let prompt = format!(
-            "以下の文字起こしテキストを最小限の修正で自然にしてください：\n\
-            - フィラー語（えー、あの、など）は極端に多い場合は削除する\n\
-            - 話し言葉や口調はそのまま保持する\n\
-            - 文体や言い回しは変更しない\n\
-            - 改行やパラグラフ区切りは必要であれば適切に入れる\n\
-            - リスト表示・箇条書きは文脈を意識して必要そうであれば積極的にいれる\n\
-            - 文脈からまず何のための文章なのか判別してそれを意識して整形すること\n\
+            "Enhance this transcribed text while preserving the original language:\n\
+            - Keep the text in its original language - do not translate\n\
+            - Remove excessive filler words (like えー, あの) only if they are overly frequent\n\
+            - Preserve casual speech patterns and tone\n\
+            - Keep the original writing style and expressions\n\
+            - Add line breaks and paragraph separations only where necessary\n\
+            - Add bullet points or lists where contextually appropriate\n\
             {}\
-            元テキスト: {}", 
+            Input text: {}", 
             dictionary_instructions, input_text
         );
 
@@ -206,7 +206,7 @@ impl TranscriptionProcessor {
             .json(&json!({
                 "model": "gpt-4o-mini",
                 "messages": [
-                    {"role": "system", "content": "あなたは高品質な日本語文字起こし校正システムです。特に指定された単語や表現は、必ず指示通りの表記を使用してください。"},
+                    {"role": "system", "content": "You are a transcription proofreader. Maintain the original language of the input text. Never translate. Output the corrected text directly without any meta-commentary."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.5,
