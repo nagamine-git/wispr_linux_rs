@@ -20,6 +20,7 @@ mod api;
 mod audio;
 mod clipboard;
 mod window;
+mod text_processor;
 
 /// Wispr Linux - 音声文字起こしアプリケーション
 #[derive(Parser, Debug)]

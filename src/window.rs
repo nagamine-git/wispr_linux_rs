@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::audio::AudioRecorder;
 use crate::api::TranscriptionAPI;
 use crate::clipboard;
+use crate::text_processor::TranscriptionProcessor;
 
 // Global static to hold the audio recorder between messages
 static mut GLOBAL_RECORDER: Option<AudioRecorder> = None;
@@ -69,6 +70,8 @@ struct UiState {
     audio_level: LevelBar,
     device_box: GtkBox,
     shortcut_frame: Frame,
+    dict_frame: Frame,
+    dict_buffer: TextBuffer,
 }
 
 impl ThreadSafeState {
@@ -97,7 +100,8 @@ impl ThreadSafeState {
     }
     
     fn transcribe(&mut self, recording_path: &str) -> Result<String> {
-        let transcript = self.api.transcribe(recording_path)?;
+        // 文字起こし処理と同時に整形まで行う
+        let transcript = self.api.transcribe_with_processing(recording_path)?;
         
         // Always copy to clipboard regardless of auto_paste setting
         match clipboard::set_text(&transcript) {
@@ -133,10 +137,12 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     let control_toggle_box = GtkBox::new(Orientation::Horizontal, 5);
     let device_toggle_button = ToggleButton::with_label("⚙"); // アイコンのみに
     let shortcut_toggle_button = ToggleButton::with_label("⌨"); // アイコンのみに
+    let dict_toggle_button = ToggleButton::with_label("📚"); // 辞書トグルボタン追加
     let record_button = Button::with_label("● Record"); // Recordボタンをここに移動し、ラベル変更
     
     control_toggle_box.pack_start(&device_toggle_button, false, false, 0);
     control_toggle_box.pack_start(&shortcut_toggle_button, false, false, 0);
+    control_toggle_box.pack_start(&dict_toggle_button, false, false, 0); // 辞書ボタン追加
     control_toggle_box.pack_start(&record_button, true, true, 0); // Recordボタンを中央寄せに
     main_box.pack_start(&control_toggle_box, false, false, 0);
     // --- ここまで --- 
@@ -181,6 +187,44 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     shortcut_vbox.pack_start(&shortcut_label, false, false, 0);
     shortcut_frame.add(&shortcut_vbox);
     main_box.pack_start(&shortcut_frame, false, false, 0);
+    // --- ここまで ---
+
+    // --- 辞書表示フレーム --- 
+    let dict_frame = Frame::new(None);
+    let dict_vbox = GtkBox::new(Orientation::Vertical, 5);
+    dict_vbox.set_margin(5);
+
+    // 辞書ヘッダー
+    let dict_header_box = GtkBox::new(Orientation::Horizontal, 5);
+    let dict_label = Label::new(Some("登録済み単語"));
+    dict_label.set_halign(gtk::Align::Start);
+    dict_label.set_hexpand(true);
+
+    // 単語登録ボタン
+    let add_word_button = Button::with_label("+ 単語登録");
+
+    dict_header_box.pack_start(&dict_label, true, true, 0);
+    dict_header_box.pack_start(&add_word_button, false, false, 0);
+    dict_vbox.pack_start(&dict_header_box, false, false, 0);
+
+    // 辞書リスト表示用スクロールウィンドウ
+    let dict_scroll = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    dict_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+    dict_scroll.set_min_content_height(100);
+    dict_scroll.set_max_content_height(150);
+
+    // 辞書リスト表示用テキストビュー
+    let dict_view = TextView::new();
+    dict_view.set_editable(false);
+    dict_view.set_cursor_visible(false);
+    dict_view.set_wrap_mode(gtk::WrapMode::Word);
+    let dict_buffer = dict_view.buffer().unwrap();
+    dict_buffer.set_text("辞書が読み込まれていません...");
+
+    dict_scroll.add(&dict_view);
+    dict_vbox.pack_start(&dict_scroll, true, true, 0);
+    dict_frame.add(&dict_vbox);
+    main_box.pack_start(&dict_frame, false, false, 0);
     // --- ここまで ---
     
     // Transcript section
@@ -231,13 +275,17 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
         audio_level: audio_level.clone(),
         device_box: device_box.clone(),
         shortcut_frame: shortcut_frame.clone(),
+        dict_frame: dict_frame.clone(),
+        dict_buffer: dict_buffer.clone(),
     };
     
     // --- トグルボタンの初期状態と接続 ---
     device_box.set_visible(false);
     shortcut_frame.set_visible(false);
+    dict_frame.set_visible(false);
     device_toggle_button.set_active(false);
     shortcut_toggle_button.set_active(false);
+    dict_toggle_button.set_active(false);
 
     let device_box_clone = device_box.clone();
     device_toggle_button.connect_toggled(move |btn| {
@@ -247,6 +295,19 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     let shortcut_frame_clone = shortcut_frame.clone();
     shortcut_toggle_button.connect_toggled(move |btn| {
         shortcut_frame_clone.set_visible(btn.is_active());
+    });
+
+    let dict_frame_clone = dict_frame.clone();
+    let thread_safe_state_clone = thread_safe_state.clone();
+    let dict_buffer_clone = dict_buffer.clone();
+    dict_toggle_button.connect_toggled(move |btn| {
+        dict_frame_clone.set_visible(btn.is_active());
+        
+        // 辞書ボタンをアクティブにしたときに辞書内容を更新
+        if btn.is_active() {
+            let config_clone = thread_safe_state_clone.lock().unwrap().config.clone();
+            update_dictionary_view(&dict_buffer_clone, &config_clone);
+        }
     });
     // --- ここまで ---
     
@@ -667,7 +728,11 @@ fn update_ui_status(ui_state: &UiState, status: AppStatus) {
 
 /// Update the transcript text in the UI
 fn update_transcript_text(buffer: &TextBuffer, text: &str) {
+    // 改行を保持して表示
     buffer.set_text(text);
+    
+    // テキストビューにスクロールして表示を更新
+    buffer.emit_by_name::<()>("changed", &[]);
 }
 
 /// Populate the device combo box with available audio devices
@@ -752,4 +817,45 @@ fn monitor_audio_input() {
     }
     
     error!("Failed to set up audio monitoring");
+}
+
+/// 辞書内容を表示用テキストビューに更新する
+fn update_dictionary_view(buffer: &TextBuffer, config: &Config) {
+    let dict_path = config.temp_dir.join("user_dictionary.json");
+    let dictionary = crate::text_processor::UserDictionary::load(&dict_path);
+    
+    // UserDictionaryのwordsフィールドにアクセスする方法が必要
+    // ここではTranscriptionProcessorを作成して辞書を取得
+    let processor = TranscriptionProcessor::new(config.clone());
+    
+    // 辞書内容の文字列を構築
+    let mut content = String::new();
+    
+    // UserDictionaryのプライベートフィールドにアクセスする代わりに
+    // ファイルを直接読み込んでJSONをパースする
+    if let Ok(file) = std::fs::File::open(&dict_path) {
+        if let Ok(json) = serde_json::from_reader(std::io::BufReader::new(file)) {
+            let dict: serde_json::Value = json;
+            
+            if let Some(words) = dict.get("words") {
+                if let Some(words_obj) = words.as_object() {
+                    if words_obj.is_empty() {
+                        content = "登録されている単語はありません".to_string();
+                    } else {
+                        for (original, replacement) in words_obj {
+                            if let Some(replacement_str) = replacement.as_str() {
+                                content.push_str(&format!("「{}」→「{}」\n", original, replacement_str));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if content.is_empty() {
+        content = "辞書の読み込みに失敗しました".to_string();
+    }
+    
+    buffer.set_text(&content);
 } 

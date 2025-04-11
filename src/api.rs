@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::Read;
 
 use crate::config::Config;
+use crate::text_processor::TranscriptionProcessor;
 
 /// OpenAI API client
 pub struct TranscriptionAPI {
@@ -59,7 +60,7 @@ impl TranscriptionAPI {
         // Create multipart form
         let form = Form::new()
             .part("file", part)
-            .text("model", "gpt-4o-transcribe");
+            .text("model", "gpt-4o-mini-transcribe");
             
         // Send request to OpenAI API
         let response = self.client.post("https://api.openai.com/v1/audio/transcriptions")
@@ -88,10 +89,32 @@ impl TranscriptionAPI {
         Ok(transcription.text)
     }
     
+    /// Transcribe an audio file with text processing
+    pub fn transcribe_with_processing(&self, audio_path: &str) -> Result<String> {
+        // 通常の文字起こし実行
+        let raw_text = self.transcribe(audio_path)?;
+        
+        // テキスト処理を適用
+        let mut processor = TranscriptionProcessor::new(self.config.clone());
+        let processed_text = processor.process_transcription(&raw_text)?;
+        
+        Ok(processed_text)
+    }
+    
     /// Implement mock transcription for testing without API key
     #[cfg(debug_assertions)]
     pub fn mock_transcribe(&self, _audio_path: &str) -> Result<String> {
         std::thread::sleep(std::time::Duration::from_secs(2));
         Ok("This is a mock transcription for testing purposes.".to_string())
+    }
+    
+    #[cfg(debug_assertions)]
+    pub fn mock_transcribe_with_processing(&self, _audio_path: &str) -> Result<String> {
+        let raw_text = "えーと、今日はですね、あのー音声認識の精度についてまぁ話をしたいとおもいます。えっと、最近の技術では、えー、かなり高い精度で認識ができるようになってきてますよね。";
+        
+        let mut processor = TranscriptionProcessor::new(self.config.clone());
+        let processed_text = processor.process_transcription(raw_text)?;
+        
+        Ok(processed_text)
     }
 } 

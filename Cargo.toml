@@ -10,24 +10,21 @@ edition = "2021"
 gtk = "0.18"
 gdk = "0.18"
 glib = "0.18"
+gio = "0.18"
 
 # Audio recording
 cpal = "0.15"
 hound = "3.5"
-symphonia = { version = "0.5", features = ["mp3", "wav"] }
 
 # HTTP client for API interactions
 reqwest = { version = "0.11", features = ["json", "multipart", "blocking"] }
 tokio = { version = "1.36", features = ["full"] }
 
-# Serialization
+# Utils
+anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-
-# Utilities
-anyhow = "1.0"
-thiserror = "1.0"
 dirs = "5.0"
 directories = "5.0"
 log = "0.4"
@@ -37,6 +34,7 @@ chrono = "0.4"
 tray-icon = { version = "0.12", optional = true }
 lazy_static = "1.4.0"
 clap = { version = "4.4", features = ["derive"] }
+regex = "1.9"
 
 [features]
 default = []
