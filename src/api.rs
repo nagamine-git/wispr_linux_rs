@@ -59,7 +59,7 @@ impl TranscriptionAPI {
         // Create multipart form
         let form = Form::new()
             .part("file", part)
-            .text("model", "whisper-1");
+            .text("model", "gpt-4o-transcribe");
             
         // Send request to OpenAI API
         let response = self.client.post("https://api.openai.com/v1/audio/transcriptions")
