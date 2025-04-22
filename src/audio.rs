@@ -5,7 +5,7 @@ use log::{info, error, warn};
 use std::fs::File;
 use std::io::BufWriter;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -17,6 +17,7 @@ pub struct AudioRecorder {
     output_file: Option<String>,
     start_time: Option<Instant>,
     stream: Option<cpal::Stream>,
+    last_active: Arc<AtomicU64>, // 録音アクティビティの最終時刻
 }
 
 impl AudioRecorder {
@@ -28,6 +29,7 @@ impl AudioRecorder {
             output_file: None,
             start_time: None,
             stream: None,
+            last_active: Arc::new(AtomicU64::new(0)),
         }
     }
     
@@ -46,6 +48,15 @@ impl AudioRecorder {
         self.output_file = Some(output_file.clone());
         self.recording.store(true, Ordering::SeqCst);
         self.start_time = Some(Instant::now());
+        
+        // 録音開始時の時刻を記録
+        self.last_active.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            Ordering::SeqCst
+        );
         
         info!("Starting audio recording to {}", output_file);
         
@@ -135,6 +146,7 @@ impl AudioRecorder {
         
         // Clone Atomic bool for capture thread
         let recording = self.recording.clone();
+        let last_active = self.last_active.clone();
         
         // Create and start the stream
         let err_fn = move |err| {
@@ -159,10 +171,30 @@ impl AudioRecorder {
         let recording_clone = self.recording.clone();
         
         std::thread::spawn(move || {
-            let sleep_duration = Duration::from_secs(max_duration);
-            std::thread::sleep(sleep_duration);
+            // 一定間隔でチェックを行う（10秒ごと）
+            let check_interval = Duration::from_secs(10);
+            let mut elapsed = Duration::from_secs(0);
             
-            if recording_clone.load(Ordering::SeqCst) {
+            while recording_clone.load(Ordering::SeqCst) && elapsed.as_secs() < max_duration {
+                std::thread::sleep(check_interval);
+                elapsed += check_interval;
+                
+                // 最終アクティビティが30秒以上前なら、異常と判断して録音停止
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let last_active_time = last_active.load(Ordering::SeqCst);
+                
+                if current_time - last_active_time > 30 && last_active_time > 0 {
+                    warn!("No audio activity detected for 30 seconds, stopping recording");
+                    recording_clone.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+            
+            // 最大時間に達したら録音を停止
+            if recording_clone.load(Ordering::SeqCst) && elapsed.as_secs() >= max_duration {
                 warn!("Reached maximum recording duration of {} seconds", max_duration);
                 recording_clone.store(false, Ordering::SeqCst);
             }
@@ -236,6 +268,9 @@ impl AudioRecorder {
     {
         info!("Setting up audio stream with type {}", std::any::type_name::<T>());
         
+        // 最終アクティブ時間の参照をクローン
+        let last_active = self.last_active.clone();
+        
         let stream = match std::any::type_name::<T>() {
             "f32" => {
                 let channels = config.channels as usize;
@@ -243,6 +278,20 @@ impl AudioRecorder {
                     config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         if recording.load(Ordering::SeqCst) {
+                            // 音声アクティビティを検出したら最終アクティブ時間を更新
+                            let has_audio = data.iter()
+                                .any(|&sample| sample.abs() > 0.01); // 無音判定の閾値
+                                
+                            if has_audio {
+                                last_active.store(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    Ordering::SeqCst
+                                );
+                            }
+                            
                             // Write samples to WAV file
                             if let Ok(mut guard) = writer.lock() {
                                 if let Some(writer) = guard.as_mut() {
@@ -262,6 +311,8 @@ impl AudioRecorder {
                                             
                                             if let Err(e) = writer.write_sample(sample_i16) {
                                                 error!("Error writing sample: {}", e);
+                                                // エラーが発生しても継続を試みる
+                                                continue;
                                             }
                                         }
                                     }
@@ -270,6 +321,7 @@ impl AudioRecorder {
                                     if data.len() > 1000 {
                                         if let Err(e) = writer.flush() {
                                             error!("Error flushing writer: {}", e);
+                                            // エラーが発生しても継続する
                                         }
                                     }
                                 }

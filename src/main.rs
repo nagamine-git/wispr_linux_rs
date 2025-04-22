@@ -53,42 +53,40 @@ fn main() -> Result<()> {
         return Err(anyhow::anyhow!("Failed to initialize GTK"));
     }
     
-    // Launch the window application
-    let (window_thread, window_sender) = window::run_window_application(config.clone())?;
-    info!("Window application started");
-    
+    // トレイ機能がある場合とない場合で分岐
     #[cfg(feature = "tray")]
-    let (tray_thread, tray_sender) = {
+    let (window_thread, window_sender, tray_thread, tray_sender) = {
         info!("Starting tray application");
-        let (thread, sender) = tray::run_tray_application(config.clone())?;
+        let (tray_thread, tray_sender) = tray::run_tray_application(config.clone())?;
         info!("Tray application started");
-        (thread, sender)
+        
+        info!("Starting window application with tray");
+        let (window_thread, window_sender) = window::run_window_application(config.clone(), tray_sender.clone())?;
+        info!("Window application started");
+        
+        (window_thread, window_sender, tray_thread, tray_sender)
+    };
+
+    #[cfg(not(feature = "tray"))]
+    let (window_thread, window_sender) = {
+        info!("Starting window application");
+        let result = window::run_window_application(config.clone())?;
+        info!("Window application started");
+        result
     };
     
     // Set up Ctrl+C handler
-    #[cfg(not(feature = "tray"))]
     let quit_tx = window_sender.clone();
-    #[cfg(feature = "tray")]
-    let quit_tx = {
-        let window_tx = window_sender.clone();
-        let tray_tx = tray_sender.clone();
-        move || {
-            let _ = window_tx.send(window::WindowMessage::Exit);
-            let _ = tray_tx.send(tray::TrayMessage::Exit);
-        }
-    };
     
-    #[cfg(not(feature = "tray"))]
+    #[cfg(feature = "tray")]
+    let tray_sender_clone = tray_sender.clone();
+    
     ctrlc::set_handler(move || {
         info!("Received Ctrl+C, shutting down");
         let _ = quit_tx.send(window::WindowMessage::Exit);
-    })
-    .context("Failed to set Ctrl+C handler")?;
-    
-    #[cfg(feature = "tray")]
-    ctrlc::set_handler(move || {
-        info!("Received Ctrl+C, shutting down");
-        quit_tx();
+        
+        #[cfg(feature = "tray")]
+        let _ = tray_sender_clone.send(tray::TrayMessage::Exit);
     })
     .context("Failed to set Ctrl+C handler")?;
     

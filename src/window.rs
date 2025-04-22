@@ -3,7 +3,7 @@ use std::thread::{self, JoinHandle};
 use std::sync::mpsc::{self, Sender};
 use gtk::{self, prelude::*};
 use gtk::{Button, Label, Window, WindowType, Box as GtkBox, Orientation, ScrolledWindow, TextView, TextBuffer};
-use gtk::{ComboBoxText, Scale, LevelBar, Frame, Separator, ToggleButton};
+use gtk::{ComboBoxText, LevelBar, Frame, ToggleButton};
 use glib;
 use glib::ControlFlow;
 use gdk;
@@ -11,12 +11,16 @@ use log::{info, error};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::audio::AudioRecorder;
 use crate::api::TranscriptionAPI;
 use crate::clipboard;
 use crate::text_processor::TranscriptionProcessor;
+
+#[cfg(feature = "tray")]
+use crate::tray;
 
 // Global static to hold the audio recorder between messages
 static mut GLOBAL_RECORDER: Option<AudioRecorder> = None;
@@ -27,6 +31,7 @@ static SHORTCUT_KEY_PRESSED: AtomicBool = AtomicBool::new(false);
 // Global audio level for monitoring (shared between threads)
 lazy_static::lazy_static! {
     static ref AUDIO_LEVEL: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    static ref RECORDING_START_TIME: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +77,7 @@ struct UiState {
     shortcut_frame: Frame,
     dict_frame: Frame,
     dict_buffer: TextBuffer,
+    timer_label: Label,
 }
 
 impl ThreadSafeState {
@@ -114,7 +120,18 @@ impl ThreadSafeState {
 }
 
 /// Runs the window application and returns a join handle and a sender for communication
+#[cfg(not(feature = "tray"))]
 pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<WindowMessage>)> {
+    run_window_application_internal(config)
+}
+
+#[cfg(feature = "tray")]
+pub fn run_window_application(config: Config, tray_sender: Sender<tray::TrayMessage>) -> Result<(JoinHandle<()>, Sender<WindowMessage>)> {
+    run_window_application_internal(config)
+}
+
+// 内部実装（トレイ機能の有無に関わらず共通）
+fn run_window_application_internal(config: Config) -> Result<(JoinHandle<()>, Sender<WindowMessage>)> {
     // Initialize GTK
     if gtk::init().is_err() {
         return Err(anyhow::anyhow!("Failed to initialize GTK."));
@@ -138,7 +155,7 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     let device_toggle_button = ToggleButton::with_label("⚙"); // アイコンのみに
     let shortcut_toggle_button = ToggleButton::with_label("⌨"); // アイコンのみに
     let dict_toggle_button = ToggleButton::with_label("📚"); // 辞書トグルボタン追加
-    let record_button = Button::with_label("● Record"); // Recordボタンをここに移動し、ラベル変更
+    let record_button = Button::with_label("● 録音"); // Recordボタンをここに移動し、ラベル変更
     
     control_toggle_box.pack_start(&device_toggle_button, false, false, 0);
     control_toggle_box.pack_start(&shortcut_toggle_button, false, false, 0);
@@ -245,9 +262,17 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     // Control buttons
     let control_box = GtkBox::new(Orientation::Horizontal, 5);
     
+    // タイマーラベルをここに追加
+    let timer_label = Label::new(Some("00:00"));
+    timer_label.set_width_chars(14); // 幅を確保
+    timer_label.set_halign(gtk::Align::Start);
+    timer_label.set_margin_start(5);
+    
     let copy_button = Button::with_label("Copy");
     let clear_button = Button::with_label("Clear");
     
+    // タイマーはコントロールボックスの左側、残りのボタンは右側に
+    control_box.pack_start(&timer_label, true, true, 0);
     control_box.pack_end(&clear_button, false, false, 0);
     control_box.pack_end(&copy_button, false, false, 0);
     
@@ -277,6 +302,7 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
         shortcut_frame: shortcut_frame.clone(),
         dict_frame: dict_frame.clone(),
         dict_buffer: dict_buffer.clone(),
+        timer_label: timer_label.clone(),
     };
     
     // --- トグルボタンの初期状態と接続 ---
@@ -311,6 +337,13 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     });
     // --- ここまで ---
     
+    // Set up Ctrl+C handler
+    #[cfg(not(feature = "tray"))]
+    let _quit_tx = tx_main.clone();
+    
+    #[cfg(feature = "tray")]
+    let _quit_tx = tx_main.clone();
+
     // Connect window close event
     let _tx_clone = tx_main.clone();
     window.connect_delete_event(move |_, _| {
@@ -377,14 +410,9 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
     
     // Set up a timer to check for messages
     let ui_state_arc = Arc::new(Mutex::new(ui_state));
+    let ui_state_arc_clone = ui_state_arc.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-        process_messages(&rx_main, &ui_state_arc)
-    });
-    
-    // Start audio level monitoring using a separate thread
-    AUDIO_MONITORING.store(true, Ordering::SeqCst);
-    thread::spawn(move || {
-        monitor_audio_input();
+        process_messages(&rx_main, &ui_state_arc_clone)
     });
     
     // Set up a timer to update the audio level bar
@@ -394,6 +422,61 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
             audio_level_clone.set_value(*level);
         }
         ControlFlow::Continue
+    });
+    
+    // Set up a timer to update the timer label during recording
+    let ui_state_arc_for_timer = ui_state_arc.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(1000), move || {
+        let ui_state = ui_state_arc_for_timer.lock().unwrap();
+        let state = ui_state.state.lock().unwrap();
+        
+        if state.status == AppStatus::Recording {
+            if let Ok(mut start_time) = RECORDING_START_TIME.lock() {
+                // 開始時間がなければ現在時刻を設定
+                if start_time.is_none() {
+                    *start_time = Some(Instant::now());
+                }
+                
+                // 経過時間を計算
+                if let Some(start) = *start_time {
+                    let elapsed = start.elapsed();
+                    let seconds = elapsed.as_secs();
+                    let minutes = seconds / 60;
+                    let remaining_seconds = seconds % 60;
+                    
+                    // 残り時間も計算（設定した最大時間から）
+                    let max_duration = state.config.recording.max_duration_secs;
+                    let remaining = if seconds < max_duration {
+                        max_duration - seconds
+                    } else {
+                        0
+                    };
+                    let remaining_minutes = remaining / 60;
+                    let remaining_seconds_mod = remaining % 60;
+                    
+                    // タイマーテキスト更新 - よりコンパクトな形式に
+                    ui_state.timer_label.set_text(&format!(
+                        "{:02}:{:02} / 残り {:02}:{:02}",
+                        minutes, remaining_seconds,
+                        remaining_minutes, remaining_seconds_mod
+                    ));
+                }
+            }
+        } else {
+            // 録音していないときはタイマーをリセット
+            if let Ok(mut start_time) = RECORDING_START_TIME.lock() {
+                *start_time = None;
+            }
+            ui_state.timer_label.set_text("00:00");
+        }
+        
+        ControlFlow::Continue
+    });
+    
+    // Start audio level monitoring using a separate thread
+    AUDIO_MONITORING.store(true, Ordering::SeqCst);
+    thread::spawn(move || {
+        monitor_audio_input();
     });
     
     // Create a thread that will be joined when the application exits
@@ -712,16 +795,53 @@ fn is_shortcut_key(event: &gdk::EventKey, shortcut: &str) -> bool {
 fn update_ui_status(ui_state: &UiState, status: AppStatus) {
     match status {
         AppStatus::Idle => {
-            ui_state.record_button.set_label("● Record"); // ボタンラベルに合わせて更新
+            ui_state.record_button.set_label("● 録音");
             ui_state.record_button.set_sensitive(true);
+            // タイマーをリセット
+            if let Ok(mut start_time) = RECORDING_START_TIME.lock() {
+                *start_time = None;
+            }
+            ui_state.timer_label.set_text("00:00");
         },
         AppStatus::Recording => {
-            ui_state.record_button.set_label("■ Stop"); // ボタンラベルに合わせて更新
+            // ボタンラベルは別途更新される
+            ui_state.record_button.set_label("■ 停止 (00:00)");
             ui_state.record_button.set_sensitive(true);
+            // タイマー開始時間を設定
+            if let Ok(mut start_time) = RECORDING_START_TIME.lock() {
+                *start_time = Some(Instant::now());
+            }
+            
+            // 録音状態のときはボタンラベルを1秒ごとに更新するタイマーを設定
+            let record_button_clone = ui_state.record_button.clone();
+            let state_arc = ui_state.state.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(1000), move || {
+                if let Ok(state) = state_arc.lock() {
+                    if state.status != AppStatus::Recording {
+                        return ControlFlow::Break;
+                    }
+                    
+                    if let Ok(start_time) = RECORDING_START_TIME.lock() {
+                        if let Some(start) = *start_time {
+                            let elapsed = start.elapsed();
+                            let seconds = elapsed.as_secs();
+                            let minutes = seconds / 60;
+                            let remaining_seconds = seconds % 60;
+                            record_button_clone.set_label(&format!("■ 停止 ({:02}:{:02})", minutes, remaining_seconds));
+                        }
+                    }
+                }
+                ControlFlow::Continue
+            });
         },
         AppStatus::Transcribing => {
-            ui_state.record_button.set_label("Processing...");
+            ui_state.record_button.set_label("処理中...");
             ui_state.record_button.set_sensitive(false);
+            // タイマーをリセット
+            if let Ok(mut start_time) = RECORDING_START_TIME.lock() {
+                *start_time = None;
+            }
+            ui_state.timer_label.set_text("処理中...");
         }
     }
 }
@@ -822,11 +942,6 @@ fn monitor_audio_input() {
 /// 辞書内容を表示用テキストビューに更新する
 fn update_dictionary_view(buffer: &TextBuffer, config: &Config) {
     let dict_path = config.temp_dir.join("user_dictionary.json");
-    let dictionary = crate::text_processor::UserDictionary::load(&dict_path);
-    
-    // UserDictionaryのwordsフィールドにアクセスする方法が必要
-    // ここではTranscriptionProcessorを作成して辞書を取得
-    let processor = TranscriptionProcessor::new(config.clone());
     
     // 辞書内容の文字列を構築
     let mut content = String::new();

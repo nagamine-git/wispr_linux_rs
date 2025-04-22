@@ -130,7 +130,7 @@ pub fn default_config() -> Config {
         api_key: String::new(),
         temp_dir: get_temp_dir(),
         recording: RecordingConfig {
-            max_duration_secs: 300,
+            max_duration_secs: 1800,
             sample_rate: 44100,
             play_sounds: true,
         },
