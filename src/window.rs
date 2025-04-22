@@ -32,6 +32,9 @@ static SHORTCUT_KEY_PRESSED: AtomicBool = AtomicBool::new(false);
 lazy_static::lazy_static! {
     static ref AUDIO_LEVEL: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     static ref RECORDING_START_TIME: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    static ref BUTTON_UPDATE_TIMER_ID: Arc<Mutex<Option<glib::SourceId>>> = Arc::new(Mutex::new(None));
+    static ref PROCESSING_STATUS_TIMER_ID: Arc<Mutex<Option<glib::SourceId>>> = Arc::new(Mutex::new(None));
+    static ref PROCESSING_DOTS: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,8 @@ pub enum WindowMessage {
     UpdateStatus(AppStatus),
     /// Update transcript text
     UpdateTranscript(String),
+    /// Stop processing timer
+    StopProcessingTimer,
 }
 
 /// Shared state that is thread-safe and can be sent between threads
@@ -126,7 +131,7 @@ pub fn run_window_application(config: Config) -> Result<(JoinHandle<()>, Sender<
 }
 
 #[cfg(feature = "tray")]
-pub fn run_window_application(config: Config, tray_sender: Sender<tray::TrayMessage>) -> Result<(JoinHandle<()>, Sender<WindowMessage>)> {
+pub fn run_window_application(config: Config, _tray_sender: Sender<tray::TrayMessage>) -> Result<(JoinHandle<()>, Sender<WindowMessage>)> {
     run_window_application_internal(config)
 }
 
@@ -345,25 +350,25 @@ fn run_window_application_internal(config: Config) -> Result<(JoinHandle<()>, Se
     let _quit_tx = tx_main.clone();
 
     // Connect window close event
-    let _tx_clone = tx_main.clone();
+    let tx_clone = tx_main.clone();
     window.connect_delete_event(move |_, _| {
-        let _ = _tx_clone.send(WindowMessage::Exit);
+        let _ = tx_clone.send(WindowMessage::Exit);
         AUDIO_MONITORING.store(false, Ordering::SeqCst);
         gtk::main_quit();
         glib::Propagation::Stop
     });
     
     // Connect record button
-    let tx_clone = tx_main.clone();
+    let _tx_clone = tx_main.clone();
     let state_clone = thread_safe_state.clone();
     record_button.connect_clicked(move |_| {
         let status = state_clone.lock().unwrap().status;
         match status {
             AppStatus::Idle => {
-                let _ = tx_clone.send(WindowMessage::StartRecording);
+                let _ = _tx_clone.send(WindowMessage::StartRecording);
             },
             AppStatus::Recording => {
-                let _ = tx_clone.send(WindowMessage::StopRecording);
+                let _ = _tx_clone.send(WindowMessage::StopRecording);
             },
             AppStatus::Transcribing => {
                 // Do nothing during transcription
@@ -454,9 +459,9 @@ fn run_window_application_internal(config: Config) -> Result<(JoinHandle<()>, Se
                     let remaining_minutes = remaining / 60;
                     let remaining_seconds_mod = remaining % 60;
                     
-                    // タイマーテキスト更新 - よりコンパクトな形式に
+                    // タイマーテキスト更新
                     ui_state.timer_label.set_text(&format!(
-                        "{:02}:{:02} / 残り {:02}:{:02}",
+                        "{:02}:{:02} / {:02}:{:02}",
                         minutes, remaining_seconds,
                         remaining_minutes, remaining_seconds_mod
                     ));
@@ -510,6 +515,17 @@ fn process_messages(rx: &mpsc::Receiver<WindowMessage>, ui_state_arc: &Arc<Mutex
                             let _ = state.stop();
                         }
                     }
+                    // 確実にオーディオモニタリングを停止
+                    AUDIO_MONITORING.store(false, Ordering::SeqCst);
+                    
+                    // 既存のタイマーが存在すれば削除
+                    if let Ok(mut timer_id) = BUTTON_UPDATE_TIMER_ID.lock() {
+                        if let Some(id) = timer_id.take() {
+                            // source_removeではなく、SourceIdのメソッドを使用
+                            id.remove();
+                        }
+                    }
+                    
                     // Exit the application
                     gtk::main_quit();
                     return ControlFlow::Break;
@@ -602,25 +618,50 @@ fn process_messages(rx: &mpsc::Receiver<WindowMessage>, ui_state_arc: &Arc<Mutex
                         match state.stop() {
                             Ok(_) => {
                                 // Process transcription if we have a recording path
-                                if let Some(path) = recording_path {
-                                    match state.transcribe(&path) {
-                                        Ok(transcript) => {
-                                            info!("Transcription complete");
-                                            state.transcript = transcript.clone();
-                                            update_transcript_text(&ui_state.transcript_buffer, &transcript);
-                                        },
-                                        Err(e) => {
-                                            error!("Transcription error: {}", e);
-                                            let error_text = format!("Error: {}", e);
-                                            state.transcript = error_text.clone();
-                                            update_transcript_text(&ui_state.transcript_buffer, &error_text);
+                                if let Some(path) = recording_path.clone() {
+                                    // スレッドを分離してトランスクリプション処理を行う
+                                    let tx_clone = ui_state.tx_main.clone();
+                                    let state_clone = state_arc.clone();
+                                    
+                                    // 処理中のインジケーターを更新するタイマー
+                                    setup_processing_status_timer(&ui_state);
+                                    
+                                    // トランスクリプション処理用スレッド
+                                    std::thread::spawn(move || {
+                                        info!("Starting transcription in background thread");
+                                        let result = if let Ok(mut state) = state_clone.lock() {
+                                            state.transcribe(&path)
+                                        } else {
+                                            Err(anyhow::anyhow!("Could not lock state for transcription"))
+                                        };
+                                        
+                                        // 処理完了後、結果をメインスレッドに送信
+                                        match result {
+                                            Ok(transcript) => {
+                                                info!("Transcription complete, sending result to main thread");
+                                                let _ = tx_clone.send(WindowMessage::UpdateTranscript(transcript));
+                                            },
+                                            Err(e) => {
+                                                error!("Transcription error: {}", e);
+                                                let error_text = format!("Error: {}", e);
+                                                let _ = tx_clone.send(WindowMessage::UpdateTranscript(error_text));
+                                            }
                                         }
-                                    }
+                                        
+                                        // 処理完了後、ステータスをIdleに戻す
+                                        let _ = tx_clone.send(WindowMessage::UpdateStatus(AppStatus::Idle));
+                                        
+                                        // 処理中タイマーを停止 - glib_idle_add_localは使わず、タイマーIDを送信
+                                        let _ = tx_clone.send(WindowMessage::StopProcessingTimer);
+                                    });
+                                    
+                                    // メインスレッドはブロックせず即座に戻る
+                                    return ControlFlow::Continue;
+                                } else {
+                                    // 録音ファイルがない場合はすぐにIdleに戻す
+                                    state.status = AppStatus::Idle;
+                                    update_ui_status(&ui_state, AppStatus::Idle);
                                 }
-                                
-                                // Always set status back to Idle so we can record again
-                                state.status = AppStatus::Idle;
-                                update_ui_status(&ui_state, AppStatus::Idle);
                             },
                             Err(e) => {
                                 error!("Failed to update state: {}", e);
@@ -648,7 +689,15 @@ fn process_messages(rx: &mpsc::Receiver<WindowMessage>, ui_state_arc: &Arc<Mutex
                         state.transcript = text.clone();
                     }
                     update_transcript_text(&ui_state.transcript_buffer, &text);
-                }
+                },
+                WindowMessage::StopProcessingTimer => {
+                    // 処理中タイマーを停止
+                    if let Ok(mut timer_id) = PROCESSING_STATUS_TIMER_ID.lock() {
+                        if let Some(id) = timer_id.take() {
+                            id.remove();
+                        }
+                    }
+                },
             }
         },
         Err(mpsc::TryRecvError::Empty) => {
@@ -793,6 +842,14 @@ fn is_shortcut_key(event: &gdk::EventKey, shortcut: &str) -> bool {
 
 /// Update the UI status (button and label)
 fn update_ui_status(ui_state: &UiState, status: AppStatus) {
+    // 既存のタイマーがあれば削除
+    if let Ok(mut timer_id) = BUTTON_UPDATE_TIMER_ID.lock() {
+        if let Some(id) = timer_id.take() {
+            // source_removeではなく、SourceIdのメソッドを使用
+            id.remove();
+        }
+    }
+
     match status {
         AppStatus::Idle => {
             ui_state.record_button.set_label("● 録音");
@@ -804,18 +861,18 @@ fn update_ui_status(ui_state: &UiState, status: AppStatus) {
             ui_state.timer_label.set_text("00:00");
         },
         AppStatus::Recording => {
-            // ボタンラベルは別途更新される
-            ui_state.record_button.set_label("■ 停止 (00:00)");
+            // 録音ボタンラベルを簡素化 - 時間表示を削除
+            ui_state.record_button.set_label("■ 停止");
             ui_state.record_button.set_sensitive(true);
             // タイマー開始時間を設定
             if let Ok(mut start_time) = RECORDING_START_TIME.lock() {
                 *start_time = Some(Instant::now());
             }
             
-            // 録音状態のときはボタンラベルを1秒ごとに更新するタイマーを設定
-            let record_button_clone = ui_state.record_button.clone();
+            // タイマーラベルの更新だけを行い、録音ボタンのラベル更新は不要に
+            let timer_label_clone = ui_state.timer_label.clone();
             let state_arc = ui_state.state.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(1000), move || {
+            let timer_id = glib::timeout_add_local(std::time::Duration::from_millis(1000), move || {
                 if let Ok(state) = state_arc.lock() {
                     if state.status != AppStatus::Recording {
                         return ControlFlow::Break;
@@ -827,12 +884,33 @@ fn update_ui_status(ui_state: &UiState, status: AppStatus) {
                             let seconds = elapsed.as_secs();
                             let minutes = seconds / 60;
                             let remaining_seconds = seconds % 60;
-                            record_button_clone.set_label(&format!("■ 停止 ({:02}:{:02})", minutes, remaining_seconds));
+                            
+                            // 残り時間も計算（設定した最大時間から）
+                            let max_duration = state.config.recording.max_duration_secs;
+                            let remaining = if seconds < max_duration {
+                                max_duration - seconds
+                            } else {
+                                0
+                            };
+                            let remaining_minutes = remaining / 60;
+                            let remaining_seconds_mod = remaining % 60;
+                            
+                            // タイマーテキスト更新
+                            timer_label_clone.set_text(&format!(
+                                "{:02}:{:02} / {:02}:{:02}",
+                                minutes, remaining_seconds,
+                                remaining_minutes, remaining_seconds_mod
+                            ));
                         }
                     }
                 }
                 ControlFlow::Continue
             });
+            
+            // タイマーIDを保存
+            if let Ok(mut timer_id_guard) = BUTTON_UPDATE_TIMER_ID.lock() {
+                *timer_id_guard = Some(timer_id);
+            }
         },
         AppStatus::Transcribing => {
             ui_state.record_button.set_label("処理中...");
@@ -925,10 +1003,14 @@ fn monitor_audio_input() {
                         continue;
                     }
                     
-                    // Keep the stream alive as long as monitoring is enabled
+                    // より短い間隔でフラグをチェックして、すぐに反応できるようにする
                     while AUDIO_MONITORING.load(Ordering::SeqCst) {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
+                    
+                    // ストリームを明示的に停止して解放
+                    drop(stream);
+                    info!("Audio monitoring stopped and resources released");
                     
                     return; // Exit after setting up monitoring with the first working device
                 }
@@ -973,4 +1055,42 @@ fn update_dictionary_view(buffer: &TextBuffer, config: &Config) {
     }
     
     buffer.set_text(&content);
+}
+
+/// トランスクリプション処理中のステータス表示を更新するタイマーをセットアップ
+fn setup_processing_status_timer(ui_state: &UiState) {
+    // 既存のタイマーがあれば削除
+    if let Ok(mut timer_id) = PROCESSING_STATUS_TIMER_ID.lock() {
+        if let Some(id) = timer_id.take() {
+            id.remove();
+        }
+    }
+    
+    // ドット数をリセット
+    if let Ok(mut dots) = PROCESSING_DOTS.lock() {
+        *dots = 0;
+    }
+    
+    // 処理中を示すアニメーションを表示
+    let record_button_clone = ui_state.record_button.clone();
+    let timer_label_clone = ui_state.timer_label.clone();
+    
+    let timer_id = glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
+        if let Ok(mut dots) = PROCESSING_DOTS.lock() {
+            *dots = (*dots + 1) % 4;
+            let dots_str = ".".repeat(*dots);
+            let padding = " ".repeat(3 - *dots);
+            
+            // ボタンとタイマーラベルのテキストを更新
+            record_button_clone.set_label(&format!("処理中{}{}", dots_str, padding));
+            timer_label_clone.set_text(&format!("処理中{}{}", dots_str, padding));
+        }
+        
+        ControlFlow::Continue
+    });
+    
+    // タイマーIDを保存
+    if let Ok(mut timer_id_guard) = PROCESSING_STATUS_TIMER_ID.lock() {
+        *timer_id_guard = Some(timer_id);
+    }
 } 

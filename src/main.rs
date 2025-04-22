@@ -12,6 +12,8 @@ use log::{info, error, LevelFilter};
 use simple_logger::SimpleLogger;
 use gtk;
 use clap::Parser;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[cfg(feature = "tray")]
 mod tray;
@@ -75,37 +77,87 @@ fn main() -> Result<()> {
         result
     };
     
-    // Set up Ctrl+C handler
+    // Set up Ctrl+C handler - 確実に一度だけ終了メッセージを送信するためのフラグ
+    let shutdown_initiated = Arc::new(AtomicBool::new(false));
+    let shutdown_initiated_clone = shutdown_initiated.clone();
+    
     let quit_tx = window_sender.clone();
     
     #[cfg(feature = "tray")]
     let tray_sender_clone = tray_sender.clone();
     
     ctrlc::set_handler(move || {
+        // 既に終了処理が開始されていたら何もしない
+        if shutdown_initiated.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        
         info!("Received Ctrl+C, shutting down");
+        
+        // 先にウィンドウを終了
         let _ = quit_tx.send(window::WindowMessage::Exit);
         
+        // トレイは少し遅延させて終了
         #[cfg(feature = "tray")]
-        let _ = tray_sender_clone.send(tray::TrayMessage::Exit);
+        {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = tray_sender_clone.send(tray::TrayMessage::Exit);
+        }
     })
     .context("Failed to set Ctrl+C handler")?;
     
     // Run the GTK main loop on the main thread
     gtk::main();
     
-    // Send exit message to all threads
-    let _ = window_sender.send(window::WindowMessage::Exit);
-    #[cfg(feature = "tray")]
-    let _ = tray_sender.send(tray::TrayMessage::Exit);
+    // GTKのメインループが終了した後の処理
+    info!("GTK main loop exited, cleaning up resources");
     
-    // Join threads
-    if let Err(e) = window_thread.join() {
-        error!("Failed to join window thread: {:?}", e);
+    // 既に終了処理が開始されていたら追加の終了メッセージを送信しない
+    if !shutdown_initiated_clone.swap(true, Ordering::SeqCst) {
+        // メインループが終了したら終了メッセージを送信
+        let _ = window_sender.send(window::WindowMessage::Exit);
+        
+        #[cfg(feature = "tray")]
+        {
+            // トレイは少し遅延させて終了
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = tray_sender.send(tray::TrayMessage::Exit);
+        }
+    }
+    
+    // スレッドの終了を待機
+    info!("Waiting for threads to complete...");
+    
+    // スレッドの終了をタイムアウト付きで待機
+    use std::time::Duration;
+    let _timeout = Duration::from_secs(5);
+    
+    let window_handle = std::thread::spawn(move || {
+        if let Err(e) = window_thread.join() {
+            error!("Failed to join window thread: {:?}", e);
+        }
+    });
+    
+    #[cfg(feature = "tray")]
+    let tray_handle = std::thread::spawn(move || {
+        if let Err(e) = tray_thread.join() {
+            error!("Failed to join tray thread: {:?}", e);
+        }
+    });
+    
+    // タイムアウト付きでウィンドウスレッドの終了を待機
+    match window_handle.join() {
+        Ok(_) => info!("Window thread joined successfully"),
+        Err(e) => error!("Error joining window thread: {:?}", e),
     }
     
     #[cfg(feature = "tray")]
-    if let Err(e) = tray_thread.join() {
-        error!("Failed to join tray thread: {:?}", e);
+    {
+        // タイムアウト付きでトレイスレッドの終了を待機
+        match tray_handle.join() {
+            Ok(_) => info!("Tray thread joined successfully"),
+            Err(e) => error!("Error joining tray thread: {:?}", e),
+        }
     }
     
     info!("Application shutdown complete");

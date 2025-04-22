@@ -33,6 +33,10 @@ pub struct RecordingConfig {
     
     /// Whether to play a sound when recording starts/stops
     pub play_sounds: bool,
+    
+    /// 無音検出機能を無効にするかどうか
+    #[serde(default)]
+    pub disable_silence_detection: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -133,6 +137,7 @@ pub fn default_config() -> Config {
             max_duration_secs: 1800,
             sample_rate: 44100,
             play_sounds: true,
+            disable_silence_detection: false,
         },
         ui: UiConfig {
             dark_mode: true,

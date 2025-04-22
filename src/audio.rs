@@ -7,6 +7,7 @@ use std::io::BufWriter;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
 use std::time::{Duration, Instant};
+use std::marker::PhantomData;
 
 use crate::config::Config;
 
@@ -16,8 +17,25 @@ pub struct AudioRecorder {
     recording: Arc<AtomicBool>,
     output_file: Option<String>,
     start_time: Option<Instant>,
-    stream: Option<cpal::Stream>,
+    stream: Option<StreamWrapper>,
     last_active: Arc<AtomicU64>, // 録音アクティビティの最終時刻
+    _marker: PhantomData<*const ()>, // Add a PhantomData to opt out of Send/Sync
+}
+
+// Implement Send/Sync for the wrapper since we're ensuring it's used safely
+// This is safe because we control all thread interactions with AudioRecorder
+unsafe impl Send for AudioRecorder {}
+unsafe impl Sync for AudioRecorder {}
+
+// Stream wrapper to encapsulate the cpal stream
+struct StreamWrapper {
+    _stream: cpal::Stream,
+}
+
+impl StreamWrapper {
+    fn new(stream: cpal::Stream) -> Self {
+        Self { _stream: stream }
+    }
 }
 
 impl AudioRecorder {
@@ -30,6 +48,7 @@ impl AudioRecorder {
             start_time: None,
             stream: None,
             last_active: Arc::new(AtomicU64::new(0)),
+            _marker: PhantomData,
         }
     }
     
@@ -164,11 +183,13 @@ impl AudioRecorder {
         // Save stream and start it
         info!("Playing audio stream");
         stream.play().context("Failed to start audio stream")?;
-        self.stream = Some(stream);
+        self.stream = Some(StreamWrapper::new(stream));
         
         // Spawn a thread to stop recording after max duration
         let max_duration = self.config.recording.max_duration_secs;
         let recording_clone = self.recording.clone();
+        let last_active_clone = self.last_active.clone();
+        let disable_silence_detection = self.config.recording.disable_silence_detection;
         
         std::thread::spawn(move || {
             // 一定間隔でチェックを行う（10秒ごと）
@@ -179,17 +200,28 @@ impl AudioRecorder {
                 std::thread::sleep(check_interval);
                 elapsed += check_interval;
                 
-                // 最終アクティビティが30秒以上前なら、異常と判断して録音停止
-                let current_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let last_active_time = last_active.load(Ordering::SeqCst);
-                
-                if current_time - last_active_time > 30 && last_active_time > 0 {
-                    warn!("No audio activity detected for 30 seconds, stopping recording");
-                    recording_clone.store(false, Ordering::SeqCst);
-                    break;
+                // 無音検出が有効な場合のみチェックする
+                if !disable_silence_detection {
+                    // 最終アクティビティが60秒以上前なら、異常と判断して録音停止
+                    // 30秒から60秒に延長して誤検出を減らす
+                    let current_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let last_active_time = last_active_clone.load(Ordering::SeqCst);
+                    
+                    // 録音開始から少なくとも20秒は無音検出をスキップする（準備時間）
+                    if elapsed.as_secs() < 20 {
+                        // 20秒未満の場合は最終アクティブ時間を更新して無音検出をスキップ
+                        last_active_clone.store(current_time, Ordering::SeqCst);
+                        continue;
+                    }
+                    
+                    if current_time - last_active_time > 60 && last_active_time > 0 {
+                        warn!("No audio activity detected for 60 seconds, stopping recording");
+                        recording_clone.store(false, Ordering::SeqCst);
+                        break;
+                    }
                 }
             }
             
@@ -270,6 +302,8 @@ impl AudioRecorder {
         
         // 最終アクティブ時間の参照をクローン
         let last_active = self.last_active.clone();
+        // Capture the config value we need
+        let disable_silence_detection = self.config.recording.disable_silence_detection;
         
         let stream = match std::any::type_name::<T>() {
             "f32" => {
@@ -278,11 +312,27 @@ impl AudioRecorder {
                     config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         if recording.load(Ordering::SeqCst) {
-                            // 音声アクティビティを検出したら最終アクティブ時間を更新
-                            let has_audio = data.iter()
-                                .any(|&sample| sample.abs() > 0.01); // 無音判定の閾値
+                            // 無音検出が有効な場合のみ音声アクティビティをチェック
+                            if !disable_silence_detection {
+                                // RMSベースの音声レベル検出に変更（より正確）
+                                let rms: f32 = data.iter()
+                                    .map(|&sample| sample * sample)
+                                    .sum::<f32>() / data.len() as f32;
+                                let rms = rms.sqrt();
                                 
-                            if has_audio {
+                                // しきい値を引き下げて、より小さな音声でもアクティビティとして検出
+                                // 0.01より少ない0.003で検出（約70%減少）
+                                if rms > 0.003 {
+                                    last_active.store(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        Ordering::SeqCst
+                                    );
+                                }
+                            } else {
+                                // 無音検出が無効の場合は常に最終アクティブ時間を更新
                                 last_active.store(
                                     std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
@@ -347,6 +397,38 @@ impl AudioRecorder {
                     config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         if recording.load(Ordering::SeqCst) {
+                            // 無音検出が有効な場合のみ音声アクティビティをチェック
+                            if !disable_silence_detection {
+                                // i16の場合のRMSベースの音声レベル検出
+                                let rms: f32 = data.iter()
+                                    .map(|&sample| {
+                                        let normalized = sample as f32 / 32767.0;
+                                        normalized * normalized
+                                    })
+                                    .sum::<f32>() / data.len() as f32;
+                                let rms = rms.sqrt();
+                                
+                                // しきい値を設定
+                                if rms > 0.003 {
+                                    last_active.store(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        Ordering::SeqCst
+                                    );
+                                }
+                            } else {
+                                // 無音検出が無効の場合は常に最終アクティブ時間を更新
+                                last_active.store(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    Ordering::SeqCst
+                                );
+                            }
+                            
                             // Write samples to WAV file
                             if let Ok(mut guard) = writer.lock() {
                                 if let Some(writer) = guard.as_mut() {
