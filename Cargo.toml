@@ -28,7 +28,7 @@ toml = "0.8"
 dirs = "5.0"
 directories = "5.0"
 log = "0.4"
-simple_logger = "4.3"
+log4rs = { version = "1.2", features = ["gzip"] }
 ctrlc = "3.4"
 chrono = "0.4"
 tray-icon = { version = "0.12", optional = true }

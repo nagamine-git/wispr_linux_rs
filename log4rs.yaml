@@ -1,0 +1,32 @@
+refresh_rate: 30 seconds
+
+appenders:
+  # コンソール出力のアペンダー
+  stdout:
+    kind: console
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S)} {h({l})} {t} - {m}{n}"
+
+  # ファイル出力のアペンダー（ローテーション機能付き）
+  file:
+    kind: rolling_file
+    path: ~/.local/log/wispr.log
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S)} {h({l})} {t} - {m}{n}"
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 10 mb
+      roller:
+        kind: fixed_window
+        pattern: ~/.local/log/wispr.{}.log.gz
+        base: 1
+        count: 5
+
+# ルートロガー
+root:
+  level: info
+  appenders:
+    - stdout
+    - file 

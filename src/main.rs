@@ -9,11 +9,13 @@
 
 use anyhow::{Result, Context};
 use log::{info, error, LevelFilter};
-use simple_logger::SimpleLogger;
 use gtk;
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::path::Path;
+use log4rs::append::rolling_file::policy::compound::trigger::size::SizeTrigger;
+use log4rs::append::rolling_file::policy::compound::roll::fixed_window::FixedWindowRoller;
 
 #[cfg(feature = "tray")]
 mod tray;
@@ -37,11 +39,48 @@ fn main() -> Result<()> {
     // コマンドライン引数の解析
     let args = Args::parse();
 
-    // Initialize logger
-    SimpleLogger::new()
-        .with_level(LevelFilter::Info)
-        .init()
-        .context("Failed to initialize logger")?;
+    // Initialize logger with log4rs
+    let config_path = Path::new("log4rs.yaml");
+    if config_path.exists() {
+        log4rs::init_file(config_path, Default::default())
+            .context("Failed to initialize logger from config file")?;
+    } else {
+        // ホームディレクトリにログディレクトリを作成
+        let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+        let log_dir = home_dir.join(".local/log");
+        std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
+        
+        // 設定ファイルが存在しない場合は、プログラム内で設定
+        let log_file = log_dir.join("wispr.log");
+        
+        // ファイルアペンダー設定
+        let file_appender = log4rs::append::rolling_file::RollingFileAppender::builder()
+            .encoder(Box::new(log4rs::encode::pattern::PatternEncoder::new("{d(%Y-%m-%d %H:%M:%S)} {h({l})} {t} - {m}{n}")))
+            .build(log_file, Box::new(log4rs::append::rolling_file::policy::compound::CompoundPolicy::new(
+                Box::new(SizeTrigger::new(10 * 1024 * 1024)), // 10MB
+                Box::new(FixedWindowRoller::builder()
+                    .build(&log_dir.join("wispr.{}.log.gz").to_string_lossy(), 5)
+                    .context("Failed to build roller")?)
+            )))
+            .context("Failed to build file appender")?;
+            
+        // コンソールアペンダー設定
+        let console_appender = log4rs::append::console::ConsoleAppender::builder()
+            .encoder(Box::new(log4rs::encode::pattern::PatternEncoder::new("{d(%Y-%m-%d %H:%M:%S)} {h({l})} {t} - {m}{n}")))
+            .build();
+            
+        // ロガー設定
+        let config = log4rs::Config::builder()
+            .appender(log4rs::config::Appender::builder().build("file", Box::new(file_appender)))
+            .appender(log4rs::config::Appender::builder().build("console", Box::new(console_appender)))
+            .build(log4rs::config::Root::builder()
+                .appender("file")
+                .appender("console")
+                .build(LevelFilter::Info))
+            .context("Failed to build log config")?;
+            
+        log4rs::init_config(config).context("Failed to initialize logger from built config")?;
+    }
 
     info!("Starting Wispr Linux");
 
